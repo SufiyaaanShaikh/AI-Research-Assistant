@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { XMLParser } from 'fast-xml-parser'
 
 const ARXIV_TRENDING_URL =
-  'http://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=10'
+  'https://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=10'
 
 const FALLBACK_PAPERS = [
   {

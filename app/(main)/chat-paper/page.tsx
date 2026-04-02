@@ -201,6 +201,7 @@ export default function ChatPaperPage() {
   const [loadingInsights, setLoadingInsights] = useState(false)
   const [summaryOpen, setSummaryOpen] = useState(false)
   const [mlWarning, setMlWarning] = useState<string | null>(null)
+  const [deepMode, setDeepMode] = useState(true)
 
   const selectedUiSimilar = useMemo(() => similarPapers.slice(0, 3), [similarPapers])
 
@@ -367,15 +368,14 @@ export default function ChatPaperPage() {
 
         const similarContext = shouldCompare && selectedUiSimilar.length > 0
           ? `\nSimilar papers for comparison:\n${selectedUiSimilar
-              .map((item, index) => `${index + 1}. ${item.title}\nAbstract: ${item.abstract}`)
-              .join('\n\n')}`
+            .map((item, index) => `${index + 1}. ${item.title}\nAbstract: ${item.abstract}`)
+            .join('\n\n')}`
           : ''
 
         const paperContext = forceDeepMode
           ? `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}`
-          : `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}\nKeywords: ${
-              keywords.join(', ') || paper.categories.join(', ')
-            }${similarContext}`
+          : `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}\nKeywords: ${keywords.join(', ') || paper.categories.join(', ')
+          }${similarContext}`
 
         const response = await fetch('/api/ai/chat-paper', {
           method: 'POST',
@@ -421,7 +421,7 @@ export default function ChatPaperPage() {
     if (!input.trim()) return
     const question = input
     setInput('')
-    await sendQuestion(question)
+    await sendQuestion(question, deepMode)
   }
 
   const handleInputKeyDown = async (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -430,7 +430,7 @@ export default function ChatPaperPage() {
     if (!input.trim() || loadingChat) return
     const question = input
     setInput('')
-    await sendQuestion(question)
+    await sendQuestion(question, deepMode)
   }
 
   const handleClearChat = () => {
@@ -517,11 +517,10 @@ export default function ChatPaperPage() {
             {messages.map((message) => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div
-                  className={`max-w-[85%] rounded-xl px-4 py-3 ${
-                    message.role === 'user'
+                  className={`max-w-[85%] rounded-xl px-4 py-3 ${message.role === 'user'
                       ? 'bg-primary text-primary-foreground'
                       : 'bg-secondary text-secondary-foreground'
-                  }`}
+                    }`}
                 >
                   <p className="text-sm whitespace-pre-line leading-relaxed">{message.content}</p>
 
@@ -547,7 +546,7 @@ export default function ChatPaperPage() {
                                 size="sm"
                                 variant="outline"
                                 className="h-auto max-w-full whitespace-normal break-words py-1 text-left text-xs"
-                                onClick={() => void sendQuestion(followUp)}
+                                onClick={() => void sendQuestion(followUp, deepMode)}
                                 disabled={loadingChat}
                               >
                                 {followUp}
@@ -577,6 +576,15 @@ export default function ChatPaperPage() {
               </Button>
             </div>
             <div className="flex items-end gap-2">
+              <Button
+                size="sm"
+                variant={deepMode ? 'default' : 'outline'}
+                onClick={() => setDeepMode(d => !d)}
+                className="text-xs gap-1"
+              >
+                <Sparkles size={12} />
+                {deepMode ? 'Full Paper Mode ON' : 'Full Paper Mode OFF'}
+              </Button>
               <Textarea
                 value={input}
                 rows={1}

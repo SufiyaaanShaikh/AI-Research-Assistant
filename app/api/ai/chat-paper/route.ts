@@ -86,6 +86,25 @@ export async function POST(request: Request) {
         // Fall back to non-RAG context on FastAPI/network errors.
       }
     }
+    // In the deep_mode block, after the RAG try-catch fails:
+    if (deepMode && pdfUrl && ragChunks.length === 0) {
+      try {
+        const textRes = await fetch('http://localhost:8000/extract-pdf-text', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pdf_url: pdfUrl }),
+        })
+        if (textRes.ok) {
+          const textData = await textRes.json()
+          if (textData.text?.trim()) {
+            // Trim to ~80K chars to stay within Groq context window
+           let contextText = textData.text.slice(0, 80000)
+          }
+        }
+      } catch {
+        // Full text also unavailable, will use abstract
+      }
+    }
     console.log("RAG RAW RESPONSE:", ragChunks)
     let contextText = ragChunks
       .map(

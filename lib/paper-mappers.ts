@@ -15,7 +15,9 @@ export function mapApiPaperToUiPaper(paper: ApiPaper): UiPaper {
     abstract: paper.summary,
     keywords: paper.categories,
     citations: 0,
-    pdfUrl: paper.link,
+    pdfUrl: paper.link.includes('/abs/')
+      ? paper.link.replace('/abs/', '/pdf/') + '.pdf'
+      : paper.link,
     summary: paper.summary,
   }
 }

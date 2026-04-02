@@ -29,45 +29,31 @@ export default function PaperDetailsPage() {
   const [mlWarning, setMlWarning] = useState<string | null>(null)
   const fetchedRef = useRef<string | null>(null)
 
+  // REPLACE the entire useEffect that loads the paper:
   useEffect(() => {
-    let mounted = true
+    if (!paperId) return
+    let cancelled = false
 
     async function loadPaper() {
       setLoading(true)
       setError(null)
-
       try {
         const res = await fetch(`/api/papers/${encodeURIComponent(paperId)}`)
         const data = (await res.json()) as PaperApiResponse
-
-        if (!res.ok || !data.paper) {
-          throw new Error(data.error || 'Paper not found')
-        }
-
-        if (mounted) {
-          setPaper(data.paper)
-        }
+        if (cancelled) return
+        if (!res.ok || !data.paper) throw new Error(data.error || 'Paper not found')
+        setPaper(data.paper)
       } catch {
-        if (mounted) {
-          setPaper(null)
-          setError('Paper not found')
-        }
+        if (cancelled) return
+        setPaper(null)
+        setError('Paper not found')
       } finally {
-        if (mounted) {
-          setLoading(false)
-        }
+        if (!cancelled) setLoading(false)  // ← Always runs on active mount
       }
     }
 
-    if (paperId) {
-      if (fetchedRef.current === paperId) return
-      fetchedRef.current = paperId
-      loadPaper()
-    }
-
-    return () => {
-      mounted = false
-    }
+    loadPaper()
+    return () => { cancelled = true }  // ← Cleanup discards stale fetch
   }, [paperId])
 
   useEffect(() => {
