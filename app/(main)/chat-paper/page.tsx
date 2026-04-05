@@ -38,11 +38,14 @@ type PapersResponse = {
 type ChatResponse = {
   answer?: string
   followUpQuestions?: string[]
+  source_sections?: string[]
   error?: string
 }
 
 const QUICK_ACTIONS: Array<{ label: string; prompt: string; deep?: boolean }> = [
   { label: 'Explain Paper', prompt: 'Explain this research paper in simple terms.' },
+  { label: 'Key Findings', prompt: 'What are the key findings and main results of this paper? Include specific numbers and metrics.', deep: true },
+  { label: 'Definitions', prompt: 'Define and explain the core concepts, terms, and novel ideas introduced in this paper.', deep: true },
   { label: 'Limitations', prompt: 'What are the main limitations of this paper?' },
   { label: 'Applications', prompt: 'What are practical applications of this work?' },
   { label: 'Future Work', prompt: 'What are strong future work directions based on this paper?' },
@@ -364,6 +367,8 @@ export default function ChatPaperPage() {
       const trimmedQuestion = question.trim()
       if (!paper || !trimmedQuestion || loadingChat) return
 
+      const shouldUseDeepMode = forceDeepMode || (trimmedQuestion.split(' ').length > 15 ? true : false)
+
       const userMessage: ChatMessage = {
         id: `${Date.now()}-user`,
         role: 'user',
@@ -382,11 +387,11 @@ export default function ChatPaperPage() {
               .join('\n\n')}`
           : ''
 
-        const paperContext = forceDeepMode
-          ? `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}`
-          : `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}\nKeywords: ${
-              keywords.join(', ') || paper.categories.join(', ')
-            }${similarContext}`
+        const paperContext = `Title: ${paper.title}
+Authors: ${paper.authors.join(', ')}
+Published: ${paper.published}
+Abstract: ${paper.summary}
+Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}`
 
         const response = await fetch('/api/ai/chat-paper', {
           method: 'POST',
@@ -395,8 +400,8 @@ export default function ChatPaperPage() {
           },
           body: JSON.stringify({
             paper_context: paperContext,
-            pdf_url: forceDeepMode ? getPdfUrl(paper) : undefined,
-            deep_mode: forceDeepMode,
+            pdf_url: shouldUseDeepMode ? getPdfUrl(paper) : undefined,
+            deep_mode: shouldUseDeepMode,
             chat_history: keepLast20(messages).map((item) => ({
               role: item.role,
               content: item.content,
@@ -418,6 +423,9 @@ export default function ChatPaperPage() {
         }
 
         setMessages((prev) => keepLast20([...prev, assistantMessage]))
+        if (data.source_sections && data.source_sections.length > 0) {
+          console.log('Answer sourced from sections:', data.source_sections)
+        }
       } catch {
         toast.error('AI generation failed')
       } finally {

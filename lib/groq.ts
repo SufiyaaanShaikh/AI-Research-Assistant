@@ -9,8 +9,18 @@ type GroqResponse = {
   }>
 }
 
-export async function generateWithGroq(prompt: string): Promise<string> {
+type GroqOptions = {
+  systemPrompt?: string
+  maxTokens?: number
+  temperature?: number
+}
+
+export async function generateWithGroq(
+  prompt: string,
+  options: GroqOptions = {}
+): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY
+  const { systemPrompt, maxTokens, temperature } = options
 
   if (!apiKey) {
     throw new Error('GROQ_API_KEY is not configured')
@@ -24,7 +34,12 @@ export async function generateWithGroq(prompt: string): Promise<string> {
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        ...(systemPrompt ? [{ role: 'system', content: systemPrompt }] : []),
+        { role: 'user', content: prompt },
+      ],
+      max_tokens: maxTokens ?? 2048,
+      temperature: temperature ?? 0.1,
     }),
   })
 

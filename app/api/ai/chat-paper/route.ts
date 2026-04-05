@@ -26,20 +26,21 @@ type RagChunk = {
 type ChatResponsePayload = {
   answer: string
   followUpQuestions: string[]
+  source_sections?: string[]
 }
 
 // FIX #4: Added a two-tier context strategy for deep mode:
 //   Tier 1 — RAG query (/rag-query): Returns semantically ranked chunks, best
 //             for targeted questions. Used first.
 //   Tier 2 — Full text extract (/extract-pdf-text): Returns the whole PDF as
-//             plain text (capped at 80K chars to stay within Groq's context
+//             plain text (capped at 120K chars to stay within Groq's context
 //             window). Used as fallback when the RAG endpoint is unavailable or
 //             returns empty chunks.
 // Previously, a failed RAG call silently fell back to only the abstract, which
 // is why the AI said "The paper does not provide Table 1" — it literally never
 // saw that section. Now when RAG fails, the full text is tried next.
 const ML_API_BASE = 'http://localhost:8000'
-const FULL_TEXT_CHAR_LIMIT = 80_000
+const FULL_TEXT_CHAR_LIMIT = 120_000
 
 function stripCodeFences(text: string): string {
   return text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim()
@@ -52,6 +53,7 @@ function parseChatResponse(text: string): ChatResponsePayload {
     return {
       answer: parsed.answer?.trim() || 'No answer generated.',
       followUpQuestions: (parsed.followUpQuestions ?? []).slice(0, 3),
+      source_sections: (parsed.source_sections ?? []).slice(0, 10),
     }
   } catch {
     const answerMatch = cleaned.match(/"answer"\s*:\s*"([\s\S]*?)"/)
@@ -59,6 +61,7 @@ function parseChatResponse(text: string): ChatResponsePayload {
     return {
       answer: extractedAnswer || 'No answer generated.',
       followUpQuestions: [],
+      source_sections: [],
     }
   }
 }
@@ -68,7 +71,7 @@ async function fetchRagChunks(pdfUrl: string, question: string): Promise<RagChun
     const ragResponse = await fetch(`${ML_API_BASE}/rag-query`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pdf_url: pdfUrl, question }),
+      body: JSON.stringify({ pdf_url: pdfUrl, question, top_n: 20 }),
     })
     console.log('RAG query response status:', ragResponse.status)
     if (!ragResponse.ok) return []
@@ -158,46 +161,61 @@ export async function POST(request: Request) {
       .map((item) => `${item.role.toUpperCase()}: ${item.content}`)
       .join('\n')
 
-    const prompt = `You are an academic research assistant.
+    const prompt = `PAPER METADATA:
+${metadataContext}
 
-You are given excerpts from a research paper.
+PAPER EXCERPTS (retrieved from the full PDF — these contain the actual paper content):
+${contextText || 'No excerpts available — answer from paper metadata only.'}
 
-Your job is to answer the user question using these excerpts.
+CONVERSATION HISTORY:
+${historyText || 'This is the first message.'}
 
-Rules:
-
-1. Always prioritize information from tables, figures, and experiment sections.
-2. If the question references results or benchmarks, analyze the table values carefully.
-3. Combine multiple excerpts when necessary.
-4. Only say information is missing if the paper truly does not contain it.
-
-Paper excerpts:
-${contextText}
-
-Chat history:
-${historyText || 'No prior history'}
-
-User question:
+USER QUESTION:
 ${userQuestion}
 
-Return STRICT JSON:
+INSTRUCTIONS:
+1. Read ALL excerpts carefully before answering. The answer may be spread across multiple excerpts.
+2. If the question asks about a definition, look for it in Introduction, Background, Preliminaries, and Methodology sections.
+3. If the question asks about results or numbers, look in Results, Evaluation, Experiment, and Table sections.
+4. If the question asks about methodology, look in Method, Approach, Architecture, and System sections.
+5. COMBINE information from multiple excerpts to build a complete answer.
+6. Quote specific numbers, terms, or findings from the excerpts when relevant.
+7. Only say something is "not mentioned in the paper" if you have checked ALL excerpts and none contain relevant information.
+8. Be specific and detailed — vague answers are not acceptable.
+
+Respond with ONLY this JSON object (no markdown, no backticks, no extra text):
 {
- "answer": "clear academic explanation",
- "followUpQuestions": [
-  "follow up question 1",
-  "follow up question 2",
-  "follow up question 3"
- ]
+  "answer": "your detailed answer here — be specific and cite sections/pages when possible",
+  "followUpQuestions": [
+    "relevant follow-up question 1",
+    "relevant follow-up question 2",
+    "relevant follow-up question 3"
+  ],
+  "source_sections": ["Section Name 1", "Section Name 2"]
 }`
 
-    const rawResponse = await generateWithGroq(prompt)
+    const rawResponse = await generateWithGroq(prompt, {
+      systemPrompt: `You are a world-class academic research assistant specializing in analyzing
+scientific papers. You are meticulous, precise, and always ground your answers in the
+provided paper excerpts. You NEVER say information is missing without thoroughly checking
+all provided excerpts. You synthesize information across multiple excerpts to construct
+complete answers. If a concept spans multiple sections of the paper, you combine them.
+You always cite which section or page you found information in.`,
+      maxTokens: 2048,
+      temperature: 0.1,
+    })
     const response = parseChatResponse(rawResponse)
 
-    return NextResponse.json(response)
+    return NextResponse.json({
+      answer: response.answer,
+      followUpQuestions: response.followUpQuestions,
+      source_sections: response.source_sections ?? [],
+    })
   } catch {
     return NextResponse.json({
       answer: 'Sorry, something went wrong while analyzing the paper.',
       followUpQuestions: [],
+      source_sections: [],
     })
   }
 }
