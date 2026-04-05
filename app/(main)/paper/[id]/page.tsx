@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
 import { ArrowLeft, ExternalLink } from 'lucide-react'
@@ -27,9 +27,14 @@ export default function PaperDetailsPage() {
   const [similarPapers, setSimilarPapers] = useState<UiPaper[]>([])
   const [mlLoading, setMlLoading] = useState(false)
   const [mlWarning, setMlWarning] = useState<string | null>(null)
-  const fetchedRef = useRef<string | null>(null)
 
-  // REPLACE the entire useEffect that loads the paper:
+  // FIX #1: Removed `fetchedRef` which caused a React 18 Strict Mode deadlock.
+  // In Strict Mode, effects run twice (mount → unmount → mount). The old code set
+  // fetchedRef on the first run and returned early on the second run, but the first
+  // run's async fetch had already set `mounted = false` via cleanup — so
+  // `setLoading(false)` was never called, leaving the page stuck on the skeleton.
+  // The fix: use a plain `cancelled` flag instead. Each effect run gets its own
+  // flag, so the active mount always completes its fetch and clears loading state.
   useEffect(() => {
     if (!paperId) return
     let cancelled = false
@@ -37,27 +42,40 @@ export default function PaperDetailsPage() {
     async function loadPaper() {
       setLoading(true)
       setError(null)
+
       try {
         const res = await fetch(`/api/papers/${encodeURIComponent(paperId)}`)
         const data = (await res.json()) as PaperApiResponse
+
         if (cancelled) return
-        if (!res.ok || !data.paper) throw new Error(data.error || 'Paper not found')
+
+        if (!res.ok || !data.paper) {
+          throw new Error(data.error || 'Paper not found')
+        }
+
         setPaper(data.paper)
       } catch {
         if (cancelled) return
         setPaper(null)
         setError('Paper not found')
       } finally {
-        if (!cancelled) setLoading(false)  // ← Always runs on active mount
+        // This now always runs on the active mount, regardless of Strict Mode.
+        if (!cancelled) {
+          setLoading(false)
+        }
       }
     }
 
     loadPaper()
-    return () => { cancelled = true }  // ← Cleanup discards stale fetch
+
+    return () => {
+      cancelled = true
+    }
   }, [paperId])
 
   useEffect(() => {
-    let mounted = true
+    if (!paper) return
+    let cancelled = false
 
     async function analyzePaper(currentPaper: Paper) {
       setMlLoading(true)
@@ -70,6 +88,8 @@ export default function PaperDetailsPage() {
           `/api/papers/search?q=${encodeURIComponent(currentPaper.title)}`,
         )
         const searchData = (await searchRes.json()) as { papers?: Paper[]; error?: string }
+
+        if (cancelled) return
 
         if (!searchRes.ok) {
           throw new Error(searchData.error || 'Failed to fetch candidate papers')
@@ -94,7 +114,7 @@ export default function PaperDetailsPage() {
           ),
         ])
 
-        if (!mounted) return
+        if (cancelled) return
 
         setKeywords(nextKeywords)
 
@@ -106,22 +126,19 @@ export default function PaperDetailsPage() {
 
         setSimilarPapers(similarUi)
       } catch {
-        if (mounted) {
-          setMlWarning('ML service unavailable')
-        }
+        if (cancelled) return
+        setMlWarning('ML service unavailable')
       } finally {
-        if (mounted) {
+        if (!cancelled) {
           setMlLoading(false)
         }
       }
     }
 
-    if (paper) {
-      analyzePaper(paper)
-    }
+    analyzePaper(paper)
 
     return () => {
-      mounted = false
+      cancelled = true
     }
   }, [paper])
 

@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server'
 import { XMLParser } from 'fast-xml-parser'
 
+// FIX #2: Changed `http://` to `https://`. The original HTTP URL could cause
+// silent failures or redirects in some Node.js server environments, which is
+// why the Search Papers page sometimes failed to load trending papers.
 const ARXIV_TRENDING_URL =
   'https://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=10'
 

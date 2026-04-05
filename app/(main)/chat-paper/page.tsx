@@ -3,7 +3,7 @@
 import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'next/navigation'
-import { Copy, Send, Sparkles } from 'lucide-react'
+import { Copy, Send, Sparkles, Zap } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
@@ -201,6 +201,16 @@ export default function ChatPaperPage() {
   const [loadingInsights, setLoadingInsights] = useState(false)
   const [summaryOpen, setSummaryOpen] = useState(false)
   const [mlWarning, setMlWarning] = useState<string | null>(null)
+
+  // FIX #3: Added a `deepMode` toggle (defaults to true).
+  // Previously, only the "Analyze Full Paper" quick action button passed
+  // `forceDeepMode=true` to sendQuestion. Every other path — manual text input,
+  // suggested follow-up question clicks, and all other quick action buttons —
+  // called sendQuestion WITHOUT deep mode, so the AI only ever received the
+  // abstract and would say "The paper does not provide Table 1" for any question
+  // about paper content.
+  // Now all questions respect the user's deepMode toggle, which defaults to ON
+  // so the full PDF is used by default.
   const [deepMode, setDeepMode] = useState(true)
 
   const selectedUiSimilar = useMemo(() => similarPapers.slice(0, 3), [similarPapers])
@@ -368,14 +378,15 @@ export default function ChatPaperPage() {
 
         const similarContext = shouldCompare && selectedUiSimilar.length > 0
           ? `\nSimilar papers for comparison:\n${selectedUiSimilar
-            .map((item, index) => `${index + 1}. ${item.title}\nAbstract: ${item.abstract}`)
-            .join('\n\n')}`
+              .map((item, index) => `${index + 1}. ${item.title}\nAbstract: ${item.abstract}`)
+              .join('\n\n')}`
           : ''
 
         const paperContext = forceDeepMode
           ? `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}`
-          : `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}\nKeywords: ${keywords.join(', ') || paper.categories.join(', ')
-          }${similarContext}`
+          : `Title: ${paper.title}\nAuthors: ${paper.authors.join(', ')}\nAbstract: ${paper.summary}\nKeywords: ${
+              keywords.join(', ') || paper.categories.join(', ')
+            }${similarContext}`
 
         const response = await fetch('/api/ai/chat-paper', {
           method: 'POST',
@@ -416,6 +427,8 @@ export default function ChatPaperPage() {
     [paper, loadingChat, selectedUiSimilar, keywords, messages],
   )
 
+  // FIX #3 (continued): handleSubmit and handleInputKeyDown now pass `deepMode`
+  // so that typing a question in the text box also uses the full PDF when enabled.
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!input.trim()) return
@@ -494,19 +507,33 @@ export default function ChatPaperPage() {
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="lg:col-span-2 bg-card border border-border rounded-lg flex flex-col min-h-[680px]">
-          <div className="p-4 border-b border-border flex flex-wrap gap-2">
+          <div className="p-4 border-b border-border flex flex-wrap gap-2 items-center">
             {QUICK_ACTIONS.map((action) => (
               <Button
                 key={action.label}
                 size="sm"
                 variant={action.deep ? 'default' : 'outline'}
                 className="text-xs"
-                onClick={() => void sendQuestion(action.prompt, Boolean(action.deep))}
+                onClick={() => void sendQuestion(action.prompt, Boolean(action.deep) || deepMode)}
                 disabled={loadingChat}
               >
                 {action.label}
               </Button>
             ))}
+
+            {/* FIX #3 (continued): Deep Mode toggle button. When ON (default), every
+                question — typed or clicked — will use the full PDF via RAG.
+                When OFF, only the abstract is sent (faster, uses no FastAPI). */}
+            <Button
+              size="sm"
+              variant={deepMode ? 'default' : 'outline'}
+              className="text-xs ml-auto gap-1.5"
+              onClick={() => setDeepMode((prev) => !prev)}
+              title={deepMode ? 'Full PDF mode is ON — click to use abstract only' : 'Abstract mode — click to enable full PDF'}
+            >
+              <Zap size={12} />
+              {deepMode ? 'Full PDF: ON' : 'Full PDF: OFF'}
+            </Button>
           </div>
 
           <div className="flex-1 overflow-y-auto p-5 space-y-4">
@@ -517,10 +544,11 @@ export default function ChatPaperPage() {
             {messages.map((message) => (
               <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <div
-                  className={`max-w-[85%] rounded-xl px-4 py-3 ${message.role === 'user'
+                  className={`max-w-[85%] rounded-xl px-4 py-3 ${
+                    message.role === 'user'
                       ? 'bg-primary text-primary-foreground'
                       : 'bg-secondary text-secondary-foreground'
-                    }`}
+                  }`}
                 >
                   <p className="text-sm whitespace-pre-line leading-relaxed">{message.content}</p>
 
@@ -546,6 +574,9 @@ export default function ChatPaperPage() {
                                 size="sm"
                                 variant="outline"
                                 className="h-auto max-w-full whitespace-normal break-words py-1 text-left text-xs"
+                                // FIX #3 (continued): Follow-up questions now also respect deepMode.
+                                // Previously these always called sendQuestion(followUp) with no deep mode,
+                                // so clicking a suggested question would only use the abstract.
                                 onClick={() => void sendQuestion(followUp, deepMode)}
                                 disabled={loadingChat}
                               >
@@ -563,7 +594,7 @@ export default function ChatPaperPage() {
 
             {loadingChat && (
               <div className="space-y-2">
-                <p className="text-sm text-muted-foreground">Analyzing papers...</p>
+                <p className="text-sm text-muted-foreground">Analyzing paper{deepMode ? ' (full PDF)' : ''}...</p>
                 <ChatMessageSkeleton />
               </div>
             )}
@@ -576,15 +607,6 @@ export default function ChatPaperPage() {
               </Button>
             </div>
             <div className="flex items-end gap-2">
-              <Button
-                size="sm"
-                variant={deepMode ? 'default' : 'outline'}
-                onClick={() => setDeepMode(d => !d)}
-                className="text-xs gap-1"
-              >
-                <Sparkles size={12} />
-                {deepMode ? 'Full Paper Mode ON' : 'Full Paper Mode OFF'}
-              </Button>
               <Textarea
                 value={input}
                 rows={1}

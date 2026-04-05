@@ -28,6 +28,19 @@ type ChatResponsePayload = {
   followUpQuestions: string[]
 }
 
+// FIX #4: Added a two-tier context strategy for deep mode:
+//   Tier 1 — RAG query (/rag-query): Returns semantically ranked chunks, best
+//             for targeted questions. Used first.
+//   Tier 2 — Full text extract (/extract-pdf-text): Returns the whole PDF as
+//             plain text (capped at 80K chars to stay within Groq's context
+//             window). Used as fallback when the RAG endpoint is unavailable or
+//             returns empty chunks.
+// Previously, a failed RAG call silently fell back to only the abstract, which
+// is why the AI said "The paper does not provide Table 1" — it literally never
+// saw that section. Now when RAG fails, the full text is tried next.
+const ML_API_BASE = 'http://localhost:8000'
+const FULL_TEXT_CHAR_LIMIT = 80_000
+
 function stripCodeFences(text: string): string {
   return text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim()
 }
@@ -50,6 +63,39 @@ function parseChatResponse(text: string): ChatResponsePayload {
   }
 }
 
+async function fetchRagChunks(pdfUrl: string, question: string): Promise<RagChunk[]> {
+  try {
+    const ragResponse = await fetch(`${ML_API_BASE}/rag-query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pdf_url: pdfUrl, question }),
+    })
+    console.log('RAG query response status:', ragResponse.status)
+    if (!ragResponse.ok) return []
+    const ragData = (await ragResponse.json()) as { context_chunks?: RagChunk[] }
+    return ragData.context_chunks ?? []
+  } catch (err) {
+    console.warn('RAG endpoint unavailable:', err)
+    return []
+  }
+}
+
+async function fetchFullText(pdfUrl: string): Promise<string> {
+  try {
+    const textResponse = await fetch(`${ML_API_BASE}/extract-pdf-text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pdf_url: pdfUrl }),
+    })
+    if (!textResponse.ok) return ''
+    const textData = (await textResponse.json()) as { text?: string }
+    return (textData.text ?? '').slice(0, FULL_TEXT_CHAR_LIMIT)
+  } catch (err) {
+    console.warn('Full text endpoint unavailable:', err)
+    return ''
+  }
+}
+
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as ChatPaperRequest
@@ -67,64 +113,46 @@ export async function POST(request: Request) {
     }
 
     const metadataContext = rawPaperContext
-    let ragChunks: RagChunk[] = []
+    let contextText = ''
+
     if (deepMode && pdfUrl) {
-      try {
-        const ragResponse = await fetch('http://localhost:8000/rag-query', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ pdf_url: pdfUrl, question: userQuestion }),
-        })
-        console.log('RAG query response status:', ragResponse.status)
-        if (ragResponse.ok) {
-          const ragData = (await ragResponse.json()) as { context_chunks?: RagChunk[] }
-          ragChunks = ragData.context_chunks ?? []
+      // Tier 1: Try RAG (semantically ranked chunks — best for targeted questions)
+      const ragChunks = await fetchRagChunks(pdfUrl, userQuestion)
+      console.log('RAG RAW RESPONSE:', ragChunks)
+      console.log('RAG chunks returned:', ragChunks.length)
+
+      if (ragChunks.length > 0) {
+        contextText = ragChunks
+          .map(
+            (chunk, index) =>
+              `[Excerpt ${index + 1}]\nSection: ${chunk.section ?? 'Unknown'}\nPage: ${chunk.page ?? 'Unknown'}\n\n${chunk.text ?? chunk.chunk_text ?? ''}`,
+          )
+          .join('\n\n')
+        console.log('Using RAG context, length:', contextText.length)
+      } else {
+        // Tier 2: RAG returned nothing — fall back to full PDF text extract.
+        // This handles the common case where FastAPI is running but the RAG
+        // pipeline returns 0 chunks (e.g. embedding model not yet loaded),
+        // as well as when /rag-query is temporarily unavailable.
+        console.log('RAG returned 0 chunks, falling back to full text extraction...')
+        contextText = await fetchFullText(pdfUrl)
+        if (contextText) {
+          console.log('Using full text context, length:', contextText.length)
+        } else {
+          console.log('Full text also unavailable, falling back to abstract metadata')
         }
-      } catch {
-        // Fall back to non-RAG context on FastAPI/network errors.
       }
     }
-    // In the deep_mode block, after the RAG try-catch fails:
-    if (deepMode && pdfUrl && ragChunks.length === 0) {
-      try {
-        const textRes = await fetch('http://localhost:8000/extract-pdf-text', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pdf_url: pdfUrl }),
-        })
-        if (textRes.ok) {
-          const textData = await textRes.json()
-          if (textData.text?.trim()) {
-            // Trim to ~80K chars to stay within Groq context window
-           let contextText = textData.text.slice(0, 80000)
-          }
-        }
-      } catch {
-        // Full text also unavailable, will use abstract
-      }
-    }
-    console.log("RAG RAW RESPONSE:", ragChunks)
-    let contextText = ragChunks
-      .map(
-        (chunk, index) =>
-          `[Excerpt ${index + 1}]
-Section: ${chunk.section ?? 'Unknown'}
-Page: ${chunk.page ?? 'Unknown'}
 
-${chunk.text ?? chunk.chunk_text ?? ''}`,
-      )
-      .join('\n\n')
-
+    // Final fallback: if both RAG and full-text extraction failed or deep mode is
+    // off, use the paper metadata (title + abstract + keywords) that was passed in.
     if (!contextText.trim()) {
       contextText = metadataContext
     }
-    console.log("CONTEXT PREVIEW:", contextText.slice(0, 500))
-    console.log('RAG chunks returned:', ragChunks.length)
+
+    console.log('CONTEXT PREVIEW:', contextText.slice(0, 500))
     console.log('Context length:', contextText.length)
-    console.log("CHUNK TEXT FIELD:", ragChunks[0]?.text)
-    console.log("CHUNK CHUNK_TEXT FIELD:", ragChunks[0]?.chunk_text)
+
     const historyText = history
       .slice(-20)
       .map((item) => `${item.role.toUpperCase()}: ${item.content}`)
