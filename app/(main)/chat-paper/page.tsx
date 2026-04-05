@@ -39,6 +39,7 @@ type ChatResponse = {
   answer?: string
   followUpQuestions?: string[]
   source_sections?: string[]
+  context_source?: 'rag' | 'full_text' | 'abstract_only'
   error?: string
 }
 
@@ -204,6 +205,7 @@ export default function ChatPaperPage() {
   const [loadingInsights, setLoadingInsights] = useState(false)
   const [summaryOpen, setSummaryOpen] = useState(false)
   const [mlWarning, setMlWarning] = useState<string | null>(null)
+  const [backendStatus, setBackendStatus] = useState<'rag' | 'full_text' | 'abstract_only' | null>(null)
 
   // FIX #3: Added a `deepMode` toggle (defaults to true).
   // Previously, only the "Analyze Full Paper" quick action button passed
@@ -545,6 +547,26 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
           </div>
 
           <div className="flex-1 overflow-y-auto p-5 space-y-4">
+            {backendStatus === 'abstract_only' && deepMode && (
+              <div className="mx-2 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
+                <strong>⚠ AI Backend Offline</strong> — The FastAPI server is not running.
+                Answers are based on the abstract only, not the full PDF.
+                Start the backend with <code className="rounded bg-amber-100 px-1 dark:bg-amber-900/40">uvicorn main:app --reload</code> for full-paper answers.
+              </div>
+            )}
+
+            {backendStatus === 'full_text' && (
+              <div className="mx-2 mb-3 rounded-lg border border-blue-500/40 bg-blue-500/10 px-4 py-3 text-sm text-blue-700 dark:text-blue-400">
+                ℹ Using full PDF text (RAG index not ready yet — answers may be slower to load on first query).
+              </div>
+            )}
+
+            {backendStatus === 'rag' && (
+              <div className="mx-2 mb-3 rounded-lg border border-green-500/40 bg-green-500/10 px-4 py-3 text-sm text-green-700 dark:text-green-400">
+                ✓ Using full PDF with smart retrieval (RAG active).
+              </div>
+            )}
+
             {messages.length === 0 && (
               <p className="text-sm text-muted-foreground">Start by asking a question about this paper.</p>
             )}
@@ -602,7 +624,9 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
 
             {loadingChat && (
               <div className="space-y-2">
-                <p className="text-sm text-muted-foreground">Analyzing paper{deepMode ? ' (full PDF)' : ''}...</p>
+                <p className="text-sm text-muted-foreground">
+                  {deepMode ? 'Connecting to AI backend...' : 'Analyzing abstract...'}
+                </p>
                 <ChatMessageSkeleton />
               </div>
             )}

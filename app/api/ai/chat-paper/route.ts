@@ -27,6 +27,7 @@ type ChatResponsePayload = {
   answer: string
   followUpQuestions: string[]
   source_sections?: string[]
+  context_source?: 'rag' | 'full_text' | 'abstract_only'
 }
 
 // FIX #4: Added a two-tier context strategy for deep mode:
@@ -39,7 +40,7 @@ type ChatResponsePayload = {
 // Previously, a failed RAG call silently fell back to only the abstract, which
 // is why the AI said "The paper does not provide Table 1" — it literally never
 // saw that section. Now when RAG fails, the full text is tried next.
-const ML_API_BASE = 'http://localhost:8000'
+const ML_API_BASE = 'http://127.0.0.1:8000'
 const FULL_TEXT_CHAR_LIMIT = 120_000
 
 function stripCodeFences(text: string): string {
@@ -117,6 +118,7 @@ export async function POST(request: Request) {
 
     const metadataContext = rawPaperContext
     let contextText = ''
+    let contextSource: 'rag' | 'full_text' | 'abstract_only' = 'abstract_only'
 
     if (deepMode && pdfUrl) {
       // Tier 1: Try RAG (semantically ranked chunks — best for targeted questions)
@@ -140,6 +142,7 @@ export async function POST(request: Request) {
         console.log('RAG returned 0 chunks, falling back to full text extraction...')
         contextText = await fetchFullText(pdfUrl)
         if (contextText) {
+          contextSource = 'full_text'
           console.log('Using full text context, length:', contextText.length)
         } else {
           console.log('Full text also unavailable, falling back to abstract metadata')
@@ -210,12 +213,14 @@ You always cite which section or page you found information in.`,
       answer: response.answer,
       followUpQuestions: response.followUpQuestions,
       source_sections: response.source_sections ?? [],
+      context_source: contextSource,
     })
   } catch {
     return NextResponse.json({
       answer: 'Sorry, something went wrong while analyzing the paper.',
       followUpQuestions: [],
       source_sections: [],
+      context_source: 'abstract_only' as const,
     })
   }
 }
