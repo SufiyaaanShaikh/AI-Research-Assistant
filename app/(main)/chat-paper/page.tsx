@@ -18,6 +18,7 @@ import { mapApiPaperToUiPaper } from '@/lib/paper-mappers'
 import {
   ensurePaperIngested,
   queryPaper,
+  queryPaperStream,
   getPaperStatus,
   type CitationItem,
   type IngestionStatus,
@@ -438,6 +439,9 @@ export default function ChatPaperPage() {
       setMessages((prev) => keepLast20([...prev, userMessage]))
       setLoadingChat(true)
 
+      let streamingAssistantId: string | null = null
+      let streamedText = ''
+
       try {
         const shouldCompare = /\b(compare|comparison|vs|versus)\b/i.test(trimmedQuestion)
         const similarContext = shouldCompare && selectedUiSimilar.length > 0
@@ -452,10 +456,45 @@ export default function ChatPaperPage() {
         const canUseNewPipeline = backendPaperId && ingestionStatus === 'ready'
 
         if (canUseNewPipeline) {
+          setBackendStatus('rag')
           // ── NEW PIPELINE: FastAPI /papers/query (persistent RAG) ──────────────
-          const ragResult = await queryPaper(backendPaperId, trimmedQuestion)
-          assistantContent = ragResult.answer
-          citations = ragResult.citations
+          streamingAssistantId = `${Date.now()}-assistant`
+          setMessages((prev) =>
+            keepLast20([
+              ...prev,
+              {
+                id: streamingAssistantId!,
+                role: 'assistant',
+                content: '',
+              },
+            ]),
+          )
+
+          let streamFailed = false
+          try {
+            await queryPaperStream(backendPaperId, trimmedQuestion, (token) => {
+              streamedText += token
+              setMessages((prev) =>
+                keepLast20(
+                  prev.map((message) =>
+                    message.id === streamingAssistantId
+                      ? { ...message, content: streamedText }
+                      : message,
+                  ),
+                ),
+              )
+            })
+          } catch {
+            streamFailed = true
+          }
+
+          if (streamFailed) {
+            const ragResult = await queryPaper(backendPaperId, trimmedQuestion)
+            assistantContent = ragResult.answer
+            citations = ragResult.citations
+          } else {
+            assistantContent = streamedText
+          }
         } else {
           // ── LEGACY FALLBACK: /api/ai/chat-paper (old RAG or abstract only) ───
           const paperContext = `Title: ${paper.title}
@@ -486,17 +525,43 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
           setBackendStatus(data.context_source ?? null)
         }
 
-        const assistantMessage: ChatMessage = {
-          id: `${Date.now()}-assistant`,
-          role: 'assistant',
-          content: assistantContent,
-          citations: citations.length > 0 ? citations : undefined,
+        if (
+          assistantContent.startsWith('{') &&
+          assistantContent.includes('detail')
+        ) {
+          throw new Error('Backend returned error response')
         }
-        setMessages((prev) => keepLast20([...prev, assistantMessage]))
+
+        if (streamingAssistantId) {
+          setMessages((prev) =>
+            keepLast20(
+              prev.map((message) =>
+                message.id === streamingAssistantId
+                  ? {
+                      ...message,
+                      content: assistantContent,
+                      citations: citations.length > 0 ? citations : undefined,
+                    }
+                  : message,
+              ),
+            ),
+          )
+        } else {
+          const assistantMessage: ChatMessage = {
+            id: `${Date.now()}-assistant`,
+            role: 'assistant',
+            content: assistantContent,
+            citations: citations.length > 0 ? citations : undefined,
+          }
+          setMessages((prev) => keepLast20([...prev, assistantMessage]))
+        }
 
       } catch (err) {
+        if (streamingAssistantId && !streamedText) {
+          setMessages((prev) => prev.filter((message) => message.id !== streamingAssistantId))
+        }
         console.error('[sendQuestion error]', err)
-        toast.error('AI generation failed')
+        toast.error('AI response failed. Please retry.')
       } finally {
         setLoadingChat(false)
       }
