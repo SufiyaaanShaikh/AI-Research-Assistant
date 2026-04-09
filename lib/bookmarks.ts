@@ -45,3 +45,25 @@ export function removeBookmark(id: string): Paper[] {
 export function isBookmarked(id: string): boolean {
   return getBookmarks().some((item) => item.id === id)
 }
+
+/**
+ * Store the backend UUID paper_id for a bookmarked paper.
+ * Called after successful ingestion to link the frontend paper to the backend record.
+ */
+export function updateBookmarkPaperId(arxivId: string, paperId: string, status: string): void {
+  if (!canUseStorage()) return
+  const bookmarks = getBookmarks()
+  const updated = bookmarks.map((paper) =>
+    paper.id === arxivId
+      ? { ...paper, paper_id: paperId, ingestion_status: status }
+      : paper
+  )
+  setBookmarks(updated)
+}
+
+/**
+ * Get the stored backend UUID for a bookmarked paper, or null if not yet ingested.
+ */
+export function getBookmarkPaperId(arxivId: string): string | null {
+  return getBookmarks().find((p) => p.id === arxivId)?.paper_id ?? null
+}

@@ -9,6 +9,8 @@ import { addBookmark, isBookmarked as isPaperBookmarked, removeBookmark } from '
 import { getCachedSummary, setCachedSummary } from '@/lib/cache'
 import { SummaryModal } from '@/components/modals/summary-modal'
 import { toast } from 'sonner'
+import { ensurePaperIngested } from '@/lib/rag-api'
+import { updateBookmarkPaperId } from '@/lib/bookmarks'
 
 interface PaperCardProps {
   paper: Paper
@@ -35,9 +37,21 @@ export function PaperCard({ paper, onBookmark, isBookmarked, onSummarize }: Pape
     } else {
       addBookmark(paper)
       setBookmarked(true)
-      toast.success('Paper bookmarked')
-    }
+      toast.success('Paper bookmarked — preparing AI chat...')
 
+      // Trigger ingestion in background — non-blocking.
+      // paper.id is the arxiv ID (e.g. "2310.06825").
+      // Only triggers if the paper looks like an arxiv ID (no spaces, typical format).
+      if (paper.id && !paper.id.includes(' ')) {
+        ensurePaperIngested(paper.id)
+          .then(({ paper_id, status }) => {
+            updateBookmarkPaperId(paper.id, paper_id, status)
+          })
+          .catch((err: unknown) => {
+            console.warn('[BookmarkCard] Ingestion trigger failed:', err)
+          })
+      }
+    }
     onBookmark?.(paper.id)
   }
 

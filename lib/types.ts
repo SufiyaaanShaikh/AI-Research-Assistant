@@ -1,5 +1,5 @@
 export interface Paper {
-  id: string
+  id: string // arxiv ID (e.g. "2310.06825") — unchanged
   title: string
   authors: string[]
   year: number
@@ -9,6 +9,8 @@ export interface Paper {
   pdfUrl?: string
   summary?: string
   similarPapers?: string[]
+  paper_id?: string // Backend UUID assigned after ingestion via /papers/add
+  ingestion_status?: string // "pending" | "ready" | "failed" | "not_ingested"
 }
 
 export interface Note {

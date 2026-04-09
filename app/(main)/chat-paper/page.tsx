@@ -15,6 +15,14 @@ import { extractKeywords, getSimilarPapers, type MLPaper } from '@/lib/ml-api'
 import { getBookmarks } from '@/lib/bookmarks'
 import { getCachedSummary, setCachedSummary } from '@/lib/cache'
 import { mapApiPaperToUiPaper } from '@/lib/paper-mappers'
+import {
+  ensurePaperIngested,
+  queryPaper,
+  getPaperStatus,
+  type CitationItem,
+  type IngestionStatus,
+} from '@/lib/rag-api'
+import { updateBookmarkPaperId } from '@/lib/bookmarks'
 import type { Paper as UiPaper } from '@/lib/types'
 import type { Paper as ApiPaper } from '@/types/paper'
 
@@ -23,6 +31,8 @@ type ChatMessage = {
   role: 'user' | 'assistant'
   content: string
   followUps?: string[]
+  citations?: CitationItem[]   // Only on assistant messages from new pipeline
+  expandedCitation?: string | null  // chunk_id of currently expanded citation
 }
 
 type PaperResponse = {
@@ -217,6 +227,10 @@ export default function ChatPaperPage() {
   // Now all questions respect the user's deepMode toggle, which defaults to ON
   // so the full PDF is used by default.
   const [deepMode, setDeepMode] = useState(true)
+  // New RAG pipeline state
+  const [ingestionStatus, setIngestionStatus] = useState<IngestionStatus | 'not_ingested'>('not_ingested')
+  const [backendPaperId, setBackendPaperId] = useState<string | null>(null)
+  const [expandedCitationId, setExpandedCitationId] = useState<string | null>(null)
 
   const selectedUiSimilar = useMemo(() => similarPapers.slice(0, 3), [similarPapers])
 
@@ -337,6 +351,29 @@ export default function ChatPaperPage() {
         if (!mounted) return
 
         setPaper(data.paper)
+        
+        // NEW: Ensure paper is ingested into the RAG backend.
+        // First check localStorage for a stored paper_id.
+        const storedPaperId = (data.paper as ApiPaper & { paper_id?: string | null }).paper_id ?? null
+        if (storedPaperId) {
+          setBackendPaperId(storedPaperId)
+          // Check current status of already-ingested paper
+          const statusResult = await getPaperStatus(storedPaperId).catch(() => null)
+          setIngestionStatus((statusResult?.status as IngestionStatus) ?? 'not_ingested')
+        } else {
+          // No paper_id stored — trigger ingestion now
+          try {
+            const { paper_id, status } = await ensurePaperIngested(data.paper.id)
+            setBackendPaperId(paper_id)
+            setIngestionStatus(status)
+            // Persist the UUID into the bookmark so future loads skip this step
+            updateBookmarkPaperId(data.paper.id, paper_id, status)
+          } catch (err) {
+            console.warn('[RAG] Ingestion trigger failed:', err)
+            setIngestionStatus('not_ingested')
+          }
+        }
+
         setMessages(loadPersistedChat(data.paper.id))
         void loadPaperSummary(data.paper)
         void loadPaperInsights(data.paper)
@@ -358,6 +395,27 @@ export default function ChatPaperPage() {
       mounted = false
     }
   }, [selectedPaperId, loadPaperInsights, loadPaperSummary])
+
+  // Poll ingestion status until paper is ready or failed.
+  useEffect(() => {
+    if (!backendPaperId) return
+    if (ingestionStatus === 'ready' || ingestionStatus === 'failed' || ingestionStatus === 'not_ingested') return
+
+    const interval = setInterval(async () => {
+      const result = await getPaperStatus(backendPaperId).catch(() => null)
+      if (!result) return
+      const status = result.status as IngestionStatus
+      setIngestionStatus(status)
+      if (status === 'ready' || status === 'failed') {
+        clearInterval(interval)
+        if (status === 'ready') {
+          updateBookmarkPaperId(paper?.id ?? '', backendPaperId, 'ready')
+        }
+      }
+    }, 3000)
+
+    return () => clearInterval(interval)
+  }, [backendPaperId, ingestionStatus, paper?.id])
 
   useEffect(() => {
     if (!paper) return
@@ -382,59 +440,68 @@ export default function ChatPaperPage() {
 
       try {
         const shouldCompare = /\b(compare|comparison|vs|versus)\b/i.test(trimmedQuestion)
-
         const similarContext = shouldCompare && selectedUiSimilar.length > 0
           ? `\nSimilar papers for comparison:\n${selectedUiSimilar
               .map((item, index) => `${index + 1}. ${item.title}\nAbstract: ${item.abstract}`)
               .join('\n\n')}`
           : ''
 
-        const paperContext = `Title: ${paper.title}
+        let assistantContent = ''
+        let citations: CitationItem[] = []
+
+        const canUseNewPipeline = backendPaperId && ingestionStatus === 'ready'
+
+        if (canUseNewPipeline) {
+          // ── NEW PIPELINE: FastAPI /papers/query (persistent RAG) ──────────────
+          const ragResult = await queryPaper(backendPaperId, trimmedQuestion)
+          assistantContent = ragResult.answer
+          citations = ragResult.citations
+        } else {
+          // ── LEGACY FALLBACK: /api/ai/chat-paper (old RAG or abstract only) ───
+          const paperContext = `Title: ${paper.title}
 Authors: ${paper.authors.join(', ')}
 Published: ${paper.published}
 Abstract: ${paper.summary}
 Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}`
 
-        const response = await fetch('/api/ai/chat-paper', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            paper_context: paperContext,
-            pdf_url: shouldUseDeepMode ? getPdfUrl(paper) : undefined,
-            deep_mode: shouldUseDeepMode,
-            chat_history: keepLast20(messages).map((item) => ({
-              role: item.role,
-              content: item.content,
-            })),
-            user_question: trimmedQuestion,
-          }),
-        })
-
-        const data = (await response.json()) as ChatResponse
-        if (!response.ok || !data.answer) {
-          throw new Error(data.error || 'Failed to generate response')
+          const response = await fetch('/api/ai/chat-paper', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              paper_context: paperContext,
+              pdf_url: (deepMode || shouldUseDeepMode) ? getPdfUrl(paper) : undefined,
+              deep_mode: deepMode || shouldUseDeepMode,
+              chat_history: keepLast20(messages).map((item) => ({
+                role: item.role,
+                content: item.content,
+              })),
+              user_question: trimmedQuestion,
+            }),
+          })
+          const data = (await response.json()) as ChatResponse
+          if (!response.ok || !data.answer) {
+            throw new Error(data.error || 'Failed to generate response')
+          }
+          assistantContent = data.answer
+          setBackendStatus(data.context_source ?? null)
         }
 
         const assistantMessage: ChatMessage = {
           id: `${Date.now()}-assistant`,
           role: 'assistant',
-          content: data.answer,
-          followUps: (data.followUpQuestions ?? []).slice(0, 3),
+          content: assistantContent,
+          citations: citations.length > 0 ? citations : undefined,
         }
-
         setMessages((prev) => keepLast20([...prev, assistantMessage]))
-        if (data.source_sections && data.source_sections.length > 0) {
-          console.log('Answer sourced from sections:', data.source_sections)
-        }
-      } catch {
+
+      } catch (err) {
+        console.error('[sendQuestion error]', err)
         toast.error('AI generation failed')
       } finally {
         setLoadingChat(false)
       }
     },
-    [paper, loadingChat, selectedUiSimilar, keywords, messages],
+    [paper, loadingChat, selectedUiSimilar, keywords, messages, backendPaperId, ingestionStatus, deepMode],
   )
 
   // FIX #3 (continued): handleSubmit and handleInputKeyDown now pass `deepMode`
@@ -547,6 +614,27 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
           </div>
 
           <div className="flex-1 overflow-y-auto p-5 space-y-4">
+            {/* RAG Pipeline Status Banner */}
+            {ingestionStatus !== 'ready' && ingestionStatus !== 'not_ingested' && (
+              <div className="mx-2 mb-3 rounded-lg border border-blue-500/40 bg-blue-500/10 px-4 py-3 text-sm text-blue-700 dark:text-blue-400 flex items-center gap-2">
+                <span className="inline-block h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+                <span>
+                  Preparing paper for AI chat&nbsp;—&nbsp;
+                  <span className="font-medium capitalize">{ingestionStatus.replace(/_/g, ' ')}</span>
+                  &hellip;
+                </span>
+              </div>
+            )}
+            {ingestionStatus === 'failed' && (
+              <div className="mx-2 mb-3 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+                ⚠ Paper ingestion failed. Chat will use legacy PDF extraction.
+              </div>
+            )}
+            {ingestionStatus === 'ready' && backendPaperId && (
+              <div className="mx-2 mb-3 rounded-lg border border-green-500/40 bg-green-500/10 px-4 py-3 text-sm text-green-700 dark:text-green-400">
+                ✓ Paper indexed — using persistent RAG with citations.
+              </div>
+            )}
             {backendStatus === 'abstract_only' && deepMode && (
               <div className="mx-2 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
                 <strong>⚠ AI Backend Offline</strong> — The FastAPI server is not running.
@@ -593,6 +681,45 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
                         <Copy size={12} className="mr-1" />
                         Copy
                       </Button>
+
+                      {/* Citations from new RAG pipeline */}
+                      {message.citations && message.citations.length > 0 && (
+                        <div className="mt-2 space-y-1">
+                          <p className="text-xs font-medium text-muted-foreground">Sources:</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {message.citations.map((citation) => (
+                              <button
+                                key={citation.chunk_id}
+                                onClick={() =>
+                                  setExpandedCitationId((prev) =>
+                                    prev === citation.chunk_id ? null : citation.chunk_id
+                                  )
+                                }
+                                className="inline-flex items-center gap-1 rounded-md border border-border bg-secondary px-2 py-0.5 text-xs text-secondary-foreground hover:bg-muted transition-colors"
+                                title={citation.snippet}
+                              >
+                                <span className="font-medium">p.{citation.page}</span>
+                                <span className="text-muted-foreground">·</span>
+                                <span className="max-w-[120px] truncate">{citation.section}</span>
+                              </button>
+                            ))}
+                          </div>
+                          {/* Expanded snippet preview */}
+                          {message.citations.map((citation) =>
+                            expandedCitationId === citation.chunk_id ? (
+                              <div
+                                key={`expanded-${citation.chunk_id}`}
+                                className="mt-1 rounded-md border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
+                              >
+                                <span className="font-medium block mb-1">
+                                  {citation.section} — Page {citation.page}
+                                </span>
+                                {citation.snippet}…
+                              </div>
+                            ) : null
+                          )}
+                        </div>
+                      )}
 
                       {message.followUps && message.followUps.length > 0 && (
                         <div className="space-y-2">
@@ -648,8 +775,12 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
                   e.currentTarget.style.height = `${e.currentTarget.scrollHeight}px`
                 }}
                 onKeyDown={(e) => void handleInputKeyDown(e)}
-                placeholder="Ask about methodology, limitations, applications, comparisons..."
-                disabled={loadingChat}
+                placeholder={
+                  ingestionStatus !== 'ready' && ingestionStatus !== 'not_ingested' && ingestionStatus !== 'failed'
+                    ? `Paper is being prepared (${ingestionStatus})... please wait`
+                    : 'Ask about methodology, limitations, applications, comparisons...'
+                }
+                disabled={loadingChat || (ingestionStatus !== 'ready' && ingestionStatus !== 'not_ingested' && ingestionStatus !== 'failed')}
                 className="max-h-52 min-h-10 resize-none"
               />
               <Button type="submit" disabled={loadingChat || !input.trim()}>
