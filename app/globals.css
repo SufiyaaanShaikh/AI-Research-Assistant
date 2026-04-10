@@ -123,3 +123,11 @@
     @apply bg-background text-foreground;
   }
 }
+
+.chat-scroll-area {
+  scrollbar-width: none;
+}
+
+.chat-scroll-area::-webkit-scrollbar {
+  display: none;
+}

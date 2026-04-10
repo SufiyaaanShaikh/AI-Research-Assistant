@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { Copy, Send, Sparkles, Zap } from 'lucide-react'
 import { toast } from 'sonner'
@@ -14,11 +14,16 @@ import { ChatMessageSkeleton } from '@/components/skeletons/content-skeleton'
 import { extractKeywords, getSimilarPapers, type MLPaper } from '@/lib/ml-api'
 import { getBookmarks } from '@/lib/bookmarks'
 import { getCachedSummary, setCachedSummary } from '@/lib/cache'
+import {
+  getCachedKeywords,
+  getCachedSimilar,
+  setCachedKeywords,
+  setCachedSimilar,
+} from '@/lib/insights-cache'
 import { mapApiPaperToUiPaper } from '@/lib/paper-mappers'
 import {
   ensurePaperIngested,
   queryPaper,
-  queryPaperStream,
   getPaperStatus,
   type CitationItem,
   type IngestionStatus,
@@ -83,14 +88,14 @@ function getChatStorageKey(paperId: string): string {
   return `${CHAT_KEY_PREFIX}${paperId}`
 }
 
-function loadPersistedChat(paperId: string): ChatMessage[] {
-  if (typeof window === 'undefined') return []
+function loadPersistedChat(paperId: string): ChatMessage[] | null {
+  if (typeof window === 'undefined') return null
 
   try {
     const raw = window.localStorage.getItem(getChatStorageKey(paperId))
-    if (!raw) return []
+    if (!raw) return null
     const parsed = JSON.parse(raw) as ChatMessage[]
-    if (!Array.isArray(parsed)) return []
+    if (!Array.isArray(parsed)) return null
     return keepLast20(
       parsed.filter(
         (item) =>
@@ -101,7 +106,7 @@ function loadPersistedChat(paperId: string): ChatMessage[] {
       ),
     )
   } catch {
-    return []
+    return null
   }
 }
 
@@ -205,12 +210,12 @@ export default function ChatPaperPage() {
   const [selectedPaperId, setSelectedPaperId] = useState(initialPaperId)
   const [paper, setPaper] = useState<ApiPaper | null>(null)
   const [aiSummary, setAiSummary] = useState('')
-  const [keywords, setKeywords] = useState<string[]>([])
-  const [similarPapers, setSimilarPapers] = useState<UiPaper[]>([])
+  const [insightsVersion, setInsightsVersion] = useState(0)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [loadingChat, setLoadingChat] = useState(false)
   const [loadingPaper, setLoadingPaper] = useState(false)
+  const [isLoadingPaper, setIsLoadingPaper] = useState(false)
   const [loadingOptions, setLoadingOptions] = useState(false)
   const [loadingSummary, setLoadingSummary] = useState(false)
   const [loadingInsights, setLoadingInsights] = useState(false)
@@ -232,8 +237,19 @@ export default function ChatPaperPage() {
   const [ingestionStatus, setIngestionStatus] = useState<IngestionStatus | 'not_ingested'>('not_ingested')
   const [backendPaperId, setBackendPaperId] = useState<string | null>(null)
   const [expandedCitationId, setExpandedCitationId] = useState<string | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement | null>(null)
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null)
+  const shouldAutoScrollRef = useRef(true)
+  const activePaperRequestRef = useRef<symbol | null>(null)
 
-  const selectedUiSimilar = useMemo(() => similarPapers.slice(0, 3), [similarPapers])
+  const currentKeywords = useMemo(
+    () => (paper ? getCachedKeywords(paper.id) ?? [] : []),
+    [paper, insightsVersion],
+  )
+  const selectedUiSimilar = useMemo(
+    () => (paper ? (getCachedSimilar(paper.id) ?? []).slice(0, 3) : []),
+    [paper, insightsVersion],
+  )
 
   useEffect(() => {
     let mounted = true
@@ -268,38 +284,95 @@ export default function ChatPaperPage() {
     }
   }, [])
 
+  useEffect(() => {
+    return () => {
+      activePaperRequestRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const container = scrollContainerRef.current
+
+    if (!container) return
+
+    const scrollElement = container
+
+    function handleScroll() {
+      const nearBottom =
+        scrollElement.scrollHeight -
+        scrollElement.scrollTop -
+        scrollElement.clientHeight < 120
+
+      shouldAutoScrollRef.current = nearBottom
+    }
+
+    scrollElement.addEventListener('scroll', handleScroll)
+
+    return () => scrollElement.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  useEffect(() => {
+    if (!shouldAutoScrollRef.current) return
+
+    messagesEndRef.current?.scrollIntoView({
+      behavior: 'smooth',
+    })
+  }, [messages])
+
+  useEffect(() => {
+    shouldAutoScrollRef.current = true
+
+    const timeoutId = window.setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView()
+    }, 50)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [paper?.id])
+
   const loadPaperInsights = useCallback(async (currentPaper: ApiPaper) => {
+    const paperId = currentPaper.id
+    const cachedKeywords = getCachedKeywords(paperId)
+    const cachedSimilarPapers = getCachedSimilar(paperId)
+    const hasKeywords = Array.isArray(cachedKeywords)
+    const hasSimilarPapers = Array.isArray(cachedSimilarPapers)
+
+    if (hasKeywords && hasSimilarPapers) {
+      return
+    }
+
     setMlWarning(null)
     setLoadingInsights(true)
-    setKeywords([])
-    setSimilarPapers([])
 
     try {
-      const [keywordResult, candidatesRes] = await Promise.all([
-        extractKeywords(currentPaper.summary),
-        fetch(`/api/papers/search?q=${encodeURIComponent(currentPaper.title)}`),
-      ])
-
-      const candidatesData = (await candidatesRes.json()) as PapersResponse
-      if (!candidatesRes.ok) {
-        throw new Error(candidatesData.error || 'Failed to fetch related papers')
+      if (!hasKeywords) {
+        const keywordResult = await extractKeywords(currentPaper.summary)
+        setCachedKeywords(paperId, keywordResult)
+        setInsightsVersion((prev) => prev + 1)
       }
 
-      setKeywords(keywordResult)
+      if (!hasSimilarPapers) {
+        const candidatesRes = await fetch(`/api/papers/search?q=${encodeURIComponent(currentPaper.title)}`)
 
-      const candidates = (candidatesData.papers ?? []).filter((item) => item.id !== currentPaper.id)
-      const similarIds = await getSimilarPapers(
-        { id: currentPaper.id, title: currentPaper.title, summary: currentPaper.summary },
-        candidates.map((item) => ({ id: item.id, title: item.title, summary: item.summary })),
-      )
+        const candidatesData = (await candidatesRes.json()) as PapersResponse
+        if (!candidatesRes.ok) {
+          throw new Error(candidatesData.error || 'Failed to fetch related papers')
+        }
 
-      const candidateMap = new Map(candidates.map((item) => [item.id, mapApiPaperToUiPaper(item)]))
-      const nextSimilar = similarIds
-        .map((item) => candidateMap.get(item.id))
-        .filter((item): item is UiPaper => Boolean(item))
-        .slice(0, 3)
+        const candidates = (candidatesData.papers ?? []).filter((item) => item.id !== currentPaper.id)
+        const similarIds = await getSimilarPapers(
+          { id: currentPaper.id, title: currentPaper.title, summary: currentPaper.summary },
+          candidates.map((item) => ({ id: item.id, title: item.title, summary: item.summary })),
+        )
 
-      setSimilarPapers(nextSimilar)
+        const candidateMap = new Map(candidates.map((item) => [item.id, mapApiPaperToUiPaper(item)]))
+        const nextSimilar = similarIds
+          .map((item) => candidateMap.get(item.id))
+          .filter((item): item is UiPaper => Boolean(item))
+          .slice(0, 3)
+
+        setCachedSimilar(paperId, nextSimilar)
+        setInsightsVersion((prev) => prev + 1)
+      }
     } catch {
       setMlWarning('ML service unavailable')
     } finally {
@@ -324,8 +397,9 @@ export default function ChatPaperPage() {
       })
       const summarizeData = (await summarizeRes.json()) as { summary?: string; error?: string }
       if (summarizeRes.ok && summarizeData.summary) {
-        setAiSummary(summarizeData.summary)
-        setCachedSummary(currentPaper.id, summarizeData.summary)
+        const cleanedSummary = summarizeData.summary.replace(/^"+|"+$/g, '')
+        setAiSummary(cleanedSummary)
+        setCachedSummary(currentPaper.id, cleanedSummary)
       } else {
         setAiSummary('')
       }
@@ -342,17 +416,24 @@ export default function ChatPaperPage() {
     let mounted = true
 
     async function loadCurrentPaper() {
+      const requestId = Symbol()
+      activePaperRequestRef.current = requestId
+
       setLoadingPaper(true)
+      setIsLoadingPaper(true)
       setAiSummary('')
 
       try {
         const res = await fetch(`/api/papers/${encodeURIComponent(selectedPaperId)}`)
         const data = (await res.json()) as PaperResponse
         if (!res.ok || !data.paper) throw new Error(data.error || 'Paper not found')
-        if (!mounted) return
+        if (!mounted || activePaperRequestRef.current !== requestId) return
 
+        const storedMessages = loadPersistedChat(data.paper.id)
+        if (!mounted || activePaperRequestRef.current !== requestId) return
+        setMessages(storedMessages ?? [])
         setPaper(data.paper)
-        
+
         // NEW: Ensure paper is ingested into the RAG backend.
         // First check localStorage for a stored paper_id.
         const storedPaperId = (data.paper as ApiPaper & { paper_id?: string | null }).paper_id ?? null
@@ -360,11 +441,13 @@ export default function ChatPaperPage() {
           setBackendPaperId(storedPaperId)
           // Check current status of already-ingested paper
           const statusResult = await getPaperStatus(storedPaperId).catch(() => null)
+          if (!mounted || activePaperRequestRef.current !== requestId) return
           setIngestionStatus((statusResult?.status as IngestionStatus) ?? 'not_ingested')
         } else {
           // No paper_id stored — trigger ingestion now
           try {
             const { paper_id, status } = await ensurePaperIngested(data.paper.id)
+            if (!mounted || activePaperRequestRef.current !== requestId) return
             setBackendPaperId(paper_id)
             setIngestionStatus(status)
             // Persist the UUID into the bookmark so future loads skip this step
@@ -375,17 +458,17 @@ export default function ChatPaperPage() {
           }
         }
 
-        setMessages(loadPersistedChat(data.paper.id))
         void loadPaperSummary(data.paper)
         void loadPaperInsights(data.paper)
       } catch {
-        if (mounted) {
+        if (mounted && activePaperRequestRef.current === requestId) {
           setPaper(null)
           toast.error('Failed to load paper')
         }
       } finally {
-        if (mounted) {
+        if (mounted && activePaperRequestRef.current === requestId) {
           setLoadingPaper(false)
+          setIsLoadingPaper(false)
         }
       }
     }
@@ -419,9 +502,9 @@ export default function ChatPaperPage() {
   }, [backendPaperId, ingestionStatus, paper?.id])
 
   useEffect(() => {
-    if (!paper) return
+    if (!paper || isLoadingPaper) return
     persistChat(paper.id, messages)
-  }, [paper, messages])
+  }, [paper, messages, isLoadingPaper])
 
   const sendQuestion = useCallback(
     async (question: string, forceDeepMode = false) => {
@@ -439,9 +522,6 @@ export default function ChatPaperPage() {
       setMessages((prev) => keepLast20([...prev, userMessage]))
       setLoadingChat(true)
 
-      let streamingAssistantId: string | null = null
-      let streamedText = ''
-
       try {
         const shouldCompare = /\b(compare|comparison|vs|versus)\b/i.test(trimmedQuestion)
         const similarContext = shouldCompare && selectedUiSimilar.length > 0
@@ -458,50 +538,20 @@ export default function ChatPaperPage() {
         if (canUseNewPipeline) {
           setBackendStatus('rag')
           // ── NEW PIPELINE: FastAPI /papers/query (persistent RAG) ──────────────
-          streamingAssistantId = `${Date.now()}-assistant`
-          setMessages((prev) =>
-            keepLast20([
-              ...prev,
-              {
-                id: streamingAssistantId!,
-                role: 'assistant',
-                content: '',
-              },
-            ]),
+          const ragResult = await queryPaper(
+            backendPaperId,
+            trimmedQuestion,
+            true,
           )
-
-          let streamFailed = false
-          try {
-            await queryPaperStream(backendPaperId, trimmedQuestion, (token) => {
-              streamedText += token
-              setMessages((prev) =>
-                keepLast20(
-                  prev.map((message) =>
-                    message.id === streamingAssistantId
-                      ? { ...message, content: streamedText }
-                      : message,
-                  ),
-                ),
-              )
-            })
-          } catch {
-            streamFailed = true
-          }
-
-          if (streamFailed) {
-            const ragResult = await queryPaper(backendPaperId, trimmedQuestion)
-            assistantContent = ragResult.answer
-            citations = ragResult.citations
-          } else {
-            assistantContent = streamedText
-          }
+          assistantContent = ragResult.answer
+          citations = ragResult.citations
         } else {
           // ── LEGACY FALLBACK: /api/ai/chat-paper (old RAG or abstract only) ───
           const paperContext = `Title: ${paper.title}
 Authors: ${paper.authors.join(', ')}
 Published: ${paper.published}
 Abstract: ${paper.summary}
-Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}`
+Keywords: ${currentKeywords.join(', ') || paper.categories.join(', ')}${similarContext}`
 
           const response = await fetch('/api/ai/chat-paper', {
             method: 'POST',
@@ -532,41 +582,23 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
           throw new Error('Backend returned error response')
         }
 
-        if (streamingAssistantId) {
-          setMessages((prev) =>
-            keepLast20(
-              prev.map((message) =>
-                message.id === streamingAssistantId
-                  ? {
-                      ...message,
-                      content: assistantContent,
-                      citations: citations.length > 0 ? citations : undefined,
-                    }
-                  : message,
-              ),
-            ),
-          )
-        } else {
-          const assistantMessage: ChatMessage = {
-            id: `${Date.now()}-assistant`,
-            role: 'assistant',
-            content: assistantContent,
-            citations: citations.length > 0 ? citations : undefined,
-          }
-          setMessages((prev) => keepLast20([...prev, assistantMessage]))
+        const assistantMessage: ChatMessage = {
+          id: `${Date.now()}-assistant`,
+          role: 'assistant',
+          content: assistantContent,
+          citations: citations.length > 0 ? citations : undefined,
         }
+        setMessages((prev) => keepLast20([...prev, assistantMessage]))
 
       } catch (err) {
-        if (streamingAssistantId && !streamedText) {
-          setMessages((prev) => prev.filter((message) => message.id !== streamingAssistantId))
-        }
         console.error('[sendQuestion error]', err)
-        toast.error('AI response failed. Please retry.')
+        const msg = err instanceof Error ? err.message : 'AI response failed'
+        toast.error(msg.length < 120 ? msg : 'AI response failed — check backend logs.')
       } finally {
         setLoadingChat(false)
       }
     },
-    [paper, loadingChat, selectedUiSimilar, keywords, messages, backendPaperId, ingestionStatus, deepMode],
+    [paper, loadingChat, selectedUiSimilar, currentKeywords, messages, backendPaperId, ingestionStatus, deepMode],
   )
 
   // FIX #3 (continued): handleSubmit and handleInputKeyDown now pass `deepMode`
@@ -648,14 +680,14 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2 bg-card border border-border rounded-lg flex flex-col min-h-[680px]">
-          <div className="p-4 border-b border-border flex flex-wrap gap-2 items-center">
+        <div className="lg:col-span-2 bg-card border border-border rounded-lg flex flex-col h-[980px] overflow-hidden">
+          <div className="p-4 border-b border-border flex flex-wrap gap-2 items-center bg-muted/30 rounded-t-lg">
             {QUICK_ACTIONS.map((action) => (
               <Button
                 key={action.label}
                 size="sm"
-                variant={action.deep ? 'default' : 'outline'}
-                className="text-xs"
+                variant={action.deep ? 'secondary' : 'ghost'}
+                className="text-xs rounded-full px-3 py-1.5 shadow-sm cursor-pointer"
                 onClick={() => void sendQuestion(action.prompt, Boolean(action.deep) || deepMode)}
                 disabled={loadingChat}
               >
@@ -678,7 +710,10 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
             </Button>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          <div
+            ref={scrollContainerRef}
+            className="flex-1 overflow-y-auto p-5 space-y-4 chat-scroll-area"
+          >
             {/* RAG Pipeline Status Banner */}
             {ingestionStatus !== 'ready' && ingestionStatus !== 'not_ingested' && (
               <div className="mx-2 mb-3 rounded-lg border border-blue-500/40 bg-blue-500/10 px-4 py-3 text-sm text-blue-700 dark:text-blue-400 flex items-center gap-2">
@@ -695,11 +730,6 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
                 ⚠ Paper ingestion failed. Chat will use legacy PDF extraction.
               </div>
             )}
-            {ingestionStatus === 'ready' && backendPaperId && (
-              <div className="mx-2 mb-3 rounded-lg border border-green-500/40 bg-green-500/10 px-4 py-3 text-sm text-green-700 dark:text-green-400">
-                ✓ Paper indexed — using persistent RAG with citations.
-              </div>
-            )}
             {backendStatus === 'abstract_only' && deepMode && (
               <div className="mx-2 mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
                 <strong>⚠ AI Backend Offline</strong> — The FastAPI server is not running.
@@ -714,11 +744,6 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
               </div>
             )}
 
-            {backendStatus === 'rag' && (
-              <div className="mx-2 mb-3 rounded-lg border border-green-500/40 bg-green-500/10 px-4 py-3 text-sm text-green-700 dark:text-green-400">
-                ✓ Using full PDF with smart retrieval (RAG active).
-              </div>
-            )}
 
             {messages.length === 0 && (
               <p className="text-sm text-muted-foreground">Start by asking a question about this paper.</p>
@@ -822,9 +847,14 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
                 <ChatMessageSkeleton />
               </div>
             )}
+
+            <div ref={messagesEndRef} />
           </div>
 
-          <form onSubmit={handleSubmit} className="p-4 border-t border-border">
+          <form
+            onSubmit={handleSubmit}
+            className="sticky bottom-0 border-t border-border p-4 bg-card backdrop-blur supports-[backdrop-filter]:bg-card/80"
+          >
             <div className="mb-3 flex justify-end">
               <Button type="button" variant="outline" size="sm" onClick={handleClearChat} disabled={loadingChat}>
                 Clear Chat
@@ -873,7 +903,9 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
               <p className="text-sm text-muted-foreground">Generating summary...</p>
             ) : aiSummary ? (
               <>
-                <p className="line-clamp-9 whitespace-pre-line text-sm text-muted-foreground">{aiSummary}</p>
+                <div className="line-clamp-9 overflow-hidden text-sm text-muted-foreground">
+                  {renderMarkdownSummary(aiSummary)}
+                </div>
                 <Button size="sm" variant="outline" onClick={() => setSummaryOpen(true)}>
                   Open Summary
                 </Button>
@@ -888,8 +920,8 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
             <div className="flex flex-wrap gap-2">
               {loadingInsights ? (
                 <p className="text-sm text-muted-foreground">Analyzing papers...</p>
-              ) : keywords.length > 0 ? (
-                keywords.map((keyword) => (
+              ) : currentKeywords.length > 0 ? (
+                currentKeywords.map((keyword) => (
                   <span
                     key={keyword}
                     className="inline-block px-2.5 py-1 bg-secondary text-secondary-foreground text-xs rounded-full"
@@ -920,6 +952,10 @@ Keywords: ${keywords.join(', ') || paper.categories.join(', ')}${similarContext}
             ) : (
               <p className="text-sm text-muted-foreground">No similar papers found.</p>
             )}
+          </div>
+
+          <div className="rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-3 text-xs text-green-700 dark:text-green-400">
+            Persistent RAG enabled with citations
           </div>
 
           {mlWarning && (

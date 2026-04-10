@@ -6,6 +6,12 @@ import { useParams } from 'next/navigation'
 import { ArrowLeft, ExternalLink } from 'lucide-react'
 
 import { PaperList } from '@/components/features/paper-list'
+import {
+  getCachedKeywords,
+  getCachedSimilar,
+  setCachedKeywords,
+  setCachedSimilar,
+} from '@/lib/insights-cache'
 import { extractKeywords, getSimilarPapers, type MLPaper } from '@/lib/ml-api'
 import { mapApiPaperToUiPaper } from '@/lib/paper-mappers'
 import type { Paper } from '@/types/paper'
@@ -23,10 +29,12 @@ export default function PaperDetailsPage() {
   const [paper, setPaper] = useState<Paper | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [keywords, setKeywords] = useState<string[]>([])
-  const [similarPapers, setSimilarPapers] = useState<UiPaper[]>([])
+  const [, setInsightsVersion] = useState(0)
   const [mlLoading, setMlLoading] = useState(false)
   const [mlWarning, setMlWarning] = useState<string | null>(null)
+
+  const keywords = paper ? getCachedKeywords(paper.id) ?? [] : []
+  const similarPapers = paper ? getCachedSimilar(paper.id) ?? [] : []
 
   // FIX #1: Removed `fetchedRef` which caused a React 18 Strict Mode deadlock.
   // In Strict Mode, effects run twice (mount → unmount → mount). The old code set
@@ -78,45 +86,61 @@ export default function PaperDetailsPage() {
     let cancelled = false
 
     async function analyzePaper(currentPaper: Paper) {
+      const cachedKeywords = getCachedKeywords(currentPaper.id)
+      const cachedSimilar = getCachedSimilar(currentPaper.id)
+      const needsKeywords = !cachedKeywords
+      const needsSimilar = !cachedSimilar
+
+      if (!needsKeywords && !needsSimilar) {
+        return
+      }
+
       setMlLoading(true)
       setMlWarning(null)
-      setKeywords([])
-      setSimilarPapers([])
 
       try {
-        const searchRes = await fetch(
-          `/api/papers/search?q=${encodeURIComponent(currentPaper.title)}`,
-        )
-        const searchData = (await searchRes.json()) as { papers?: Paper[]; error?: string }
+        let candidates: Paper[] = []
+        let mlCandidates: MLPaper[] = []
 
-        if (cancelled) return
+        if (needsSimilar) {
+          const searchRes = await fetch(
+            `/api/papers/search?q=${encodeURIComponent(currentPaper.title)}`,
+          )
+          const searchData = (await searchRes.json()) as { papers?: Paper[]; error?: string }
 
-        if (!searchRes.ok) {
-          throw new Error(searchData.error || 'Failed to fetch candidate papers')
+          if (cancelled) return
+
+          if (!searchRes.ok) {
+            throw new Error(searchData.error || 'Failed to fetch candidate papers')
+          }
+
+          candidates = (searchData.papers ?? []).filter((item) => item.id !== currentPaper.id)
+          mlCandidates = candidates.map((item) => ({
+            id: item.id,
+            title: item.title,
+            summary: item.summary,
+          }))
         }
 
-        const candidates = (searchData.papers ?? []).filter((item) => item.id !== currentPaper.id)
-        const mlCandidates: MLPaper[] = candidates.map((item) => ({
-          id: item.id,
-          title: item.title,
-          summary: item.summary,
-        }))
-
         const [nextKeywords, similar] = await Promise.all([
-          extractKeywords(currentPaper.summary),
-          getSimilarPapers(
-            {
-              id: currentPaper.id,
-              title: currentPaper.title,
-              summary: currentPaper.summary,
-            },
-            mlCandidates,
-          ),
+          needsKeywords ? extractKeywords(currentPaper.summary) : Promise.resolve(cachedKeywords ?? []),
+          needsSimilar
+            ? getSimilarPapers(
+                {
+                  id: currentPaper.id,
+                  title: currentPaper.title,
+                  summary: currentPaper.summary,
+                },
+                mlCandidates,
+              )
+            : Promise.resolve([]),
         ])
 
         if (cancelled) return
 
-        setKeywords(nextKeywords)
+        if (needsKeywords) {
+          setCachedKeywords(currentPaper.id, nextKeywords)
+        }
 
         const byId = new Map(candidates.map((item) => [item.id, mapApiPaperToUiPaper(item)]))
         const similarUi = similar
@@ -124,7 +148,10 @@ export default function PaperDetailsPage() {
           .filter((item): item is UiPaper => Boolean(item))
           .slice(0, 3)
 
-        setSimilarPapers(similarUi)
+        if (needsSimilar) {
+          setCachedSimilar(currentPaper.id, similarUi)
+        }
+        setInsightsVersion((prev) => prev + 1)
       } catch {
         if (cancelled) return
         setMlWarning('ML service unavailable')
